@@ -740,6 +740,66 @@ float log_softmax(int vocab_size, float* logits, int token) {
 }
 
 // ----------------------------------------------------------------------------
+// perplexity eval loop
+
+void eval(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, int steps) {
+    char prompt[1024];
+    FILE *prompt_file = fopen("eval_prompt.txt", "r");
+    fgets(prompt, 1024, prompt_file);
+    printf("String read: %s\n", prompt);
+
+    // encode the (string) prompt into tokens sequence
+    int num_prompt_tokens = 0;
+    int* prompt_tokens = (int*)malloc((strlen(prompt)+3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
+    encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
+    printf("%d\n", num_prompt_tokens);
+    if (num_prompt_tokens < 1) {
+        fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // start the main loop
+    long start = 0;  // used to time our code, only initialized after first iteration
+    int next;        // will store the next token in the sequence
+    int token = prompt_tokens[0]; // kick off with the first token in the prompt
+    int pos = 0;     // position in the sequence
+    float nll;
+    float nll2;
+    while (pos < steps) {
+
+        // forward the transformer to get logits for the next token
+        float* logits = forward(transformer, token, pos);
+        next = prompt_tokens[pos + 1];
+        pos++;
+
+        // data-dependent terminating condition: the BOS (=1) token delimits sequences
+        if (next == 1) { break; }
+        
+        float results = log_softmax(sampler->vocab_size, logits, token);
+        float neg_res = -results;
+        nll += neg_res;
+        nll2 += neg_res*neg_res;
+
+        token = next;
+    }
+
+    nll /= steps;
+    float ppl = exp(nll);
+    printf("PPL=%f\n", ppl);
+    nll2 /= steps;
+    nll2 -= nll * nll;
+    if (nll2 > 0) {
+        nll2 = sqrt(nll2/(steps-1));
+        printf("Final estimate: PPL = %f +/- %f\n", ppl, nll2*ppl);
+    } else {
+        printf("Unexpected negative standard deviation of log(prob)\n");
+    }
+    
+    fclose(prompt_file);
+    free(prompt_tokens);
+}
+
+// ----------------------------------------------------------------------------
 // generation loop
 
 void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
@@ -760,8 +820,6 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     int next;        // will store the next token in the sequence
     int token = prompt_tokens[0]; // kick off with the first token in the prompt
     int pos = 0;     // position in the sequence
-    float nll;
-    float nll2;
     while (pos < steps) {
 
         // forward the transformer to get logits for the next token
@@ -784,12 +842,6 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
         char* piece = decode(tokenizer, token, next);
         safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
         fflush(stdout);
-        
-        float results = log_softmax(sampler->vocab_size, logits, token);
-        float neg_res = -results;
-        nll += neg_res;
-        nll2 += neg_res*neg_res;
-
         token = next;
 
         // init the timer here because the first iteration can be slower
@@ -797,17 +849,6 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     }
     printf("\n");
 
-    nll /= steps;
-    float ppl = exp(nll);
-    printf("PPL=%f\n", ppl);
-    nll2 /= steps;
-    nll2 -= nll * nll;
-    if (nll2 > 0) {
-        nll2 = sqrt(nll2/(steps-1));
-        printf("Final estimate: PPL = %f +/- %f\n", ppl, nll2*ppl);
-    } else {
-        printf("Unexpected negative standard deviation of log(prob)\n");
-    }
     // report achieved tok/s (pos-1 because the timer starts after first iteration)
     if (pos > 1) {
         long end = time_in_ms();
@@ -948,7 +989,7 @@ int main(int argc, char *argv[]) {
     int steps = 256;            // number of steps to run for
     char *prompt = NULL;        // prompt string
     unsigned long long rng_seed = 0; // seed rng with time by default
-    char *mode = "generate";    // generate|chat
+    char *mode = "eval";    // generate|chat|eval
     char *system_prompt = NULL; // the (optional) system prompt to use in chat mode
 
     // poor man's C argparse so we can override the defaults above from the command line
@@ -994,6 +1035,8 @@ int main(int argc, char *argv[]) {
         generate(&transformer, &tokenizer, &sampler, prompt, steps);
     } else if (strcmp(mode, "chat") == 0) {
         chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
+    } if (strcmp(mode, "eval") == 0) {
+        eval(&transformer, &tokenizer, &sampler, steps);
     } else {
         fprintf(stderr, "unknown mode: %s\n", mode);
         error_usage();
