@@ -743,58 +743,55 @@ float log_softmax(int vocab_size, float* logits, int token) {
 // perplexity eval loop
 
 void eval(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, int steps) {
-    char prompt[1024];
+    // assume prompt here is the full dataset over which to measure PPL
+    char prompt[4096];
     FILE *prompt_file = fopen("eval_prompt.txt", "r");
-    fgets(prompt, 1024, prompt_file);
+    fgets(prompt, 4096, prompt_file);
     printf("String read: %s\n", prompt);
 
     // encode the (string) prompt into tokens sequence
     int num_prompt_tokens = 0;
     int* prompt_tokens = (int*)malloc((strlen(prompt)+3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
     encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
-    printf("%d\n", num_prompt_tokens);
     if (num_prompt_tokens < 1) {
         fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
         exit(EXIT_FAILURE);
     }
 
+    int num_chunks = (num_prompt_tokens) / steps; // assume full length chunks
+
+    float nll = 0;
+    int count = 0;
+
+    printf("num_chunks: %d\n", num_chunks);
+
     // start the main loop
-    long start = 0;  // used to time our code, only initialized after first iteration
-    int next;        // will store the next token in the sequence
-    int token = prompt_tokens[0]; // kick off with the first token in the prompt
-    int pos = 0;     // position in the sequence
-    float nll;
-    float nll2;
-    while (pos < steps) {
+    int chunk = 0;
+    while (chunk < num_chunks) { // change back to num_chunks once kv cache freeing
+        printf("processing chunk %d\n", chunk);
+        int token = prompt_tokens[chunk*steps];
 
-        // forward the transformer to get logits for the next token
-        float* logits = forward(transformer, token, pos);
-        next = prompt_tokens[pos + 1];
-        pos++;
+        // free KV cache here!!!
+        for (int pos=0; pos < steps-1; pos++) {
+            float* logits = forward(transformer, token, pos);
+            token = prompt_tokens[chunk*steps + (pos+1)];
+            softmax(logits, sampler->vocab_size); // should store smax in place
+            float next_token_prob = logits[token]; // may need to specify vocab size here
+            nll += -log(next_token_prob);
+            count++;
+        }
 
-        // data-dependent terminating condition: the BOS (=1) token delimits sequences
-        if (next == 1) { break; }
-        
-        float results = log_softmax(sampler->vocab_size, logits, token);
-        float neg_res = -results;
-        nll += neg_res;
-        nll2 += neg_res*neg_res;
-
-        token = next;
+        // free / realloc KV cache
+        free_run_state(&transformer->state); // TODO test this
+        malloc_run_state(&transformer->state, &transformer->config);
+        chunk++;
     }
+    printf("\n");
 
-    nll /= steps;
-    float ppl = exp(nll);
-    printf("PPL=%f\n", ppl);
-    nll2 /= steps;
-    nll2 -= nll * nll;
-    if (nll2 > 0) {
-        nll2 = sqrt(nll2/(steps-1));
-        printf("Final estimate: PPL = %f +/- %f\n", ppl, nll2*ppl);
-    } else {
-        printf("Unexpected negative standard deviation of log(prob)\n");
-    }
-    
+    float nll_full = exp(nll / count);
+
+    printf("PPL: %f \n\n", nll_full);
+
     fclose(prompt_file);
     free(prompt_tokens);
 }
@@ -1035,7 +1032,7 @@ int main(int argc, char *argv[]) {
         generate(&transformer, &tokenizer, &sampler, prompt, steps);
     } else if (strcmp(mode, "chat") == 0) {
         chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
-    } if (strcmp(mode, "eval") == 0) {
+    } else if (strcmp(mode, "eval") == 0) {
         eval(&transformer, &tokenizer, &sampler, steps);
     } else {
         fprintf(stderr, "unknown mode: %s\n", mode);

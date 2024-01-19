@@ -16,7 +16,7 @@
 #endif
 // ----------------------------------------------------------------------------
 // Globals
-int GS = 0; // group size global for quantization of the weights
+//int GS = 0; // group size global for quantization of the weights
 
 // ----------------------------------------------------------------------------
 // Transformer model
@@ -33,7 +33,7 @@ typedef struct {
 
 typedef struct {
     int8_t* q;    // quantized values
-    float* s; // scaling factors
+    float s; // scaling factors
 } QuantizedTensor;
 
 typedef struct {
@@ -96,8 +96,8 @@ void malloc_run_state(RunState* s, Config* p) {
     s->xb2 = calloc(p->dim, sizeof(float));
     s->hb = calloc(p->hidden_dim, sizeof(float));
     s->hb2 = calloc(p->hidden_dim, sizeof(float));
-    s->xq = (QuantizedTensor) { .q = calloc(p->dim, sizeof(int8_t)), .s = calloc(p->dim, sizeof(float)) };
-    s->hq = (QuantizedTensor) { .q = calloc(p->hidden_dim, sizeof(int8_t)), .s = calloc(p->hidden_dim, sizeof(float)) };
+    s->xq = (QuantizedTensor) { .q = calloc(p->dim, sizeof(int8_t)), .s = 0.0f };
+    s->hq = (QuantizedTensor) { .q = calloc(p->hidden_dim, sizeof(int8_t)), .s = 0.0f };
     s->q = calloc(p->dim, sizeof(float));
     s->k = calloc(kv_dim, sizeof(float));
     s->v = calloc(kv_dim, sizeof(float));
@@ -121,9 +121,7 @@ void free_run_state(RunState* s) {
     free(s->hb);
     free(s->hb2);
     free(s->xq.q);
-    free(s->xq.s);
     free(s->hq.q);
-    free(s->hq.s);
     free(s->q);
     free(s->k);
     free(s->v);
@@ -138,35 +136,31 @@ void free_run_state(RunState* s) {
 
 void dequantize(QuantizedTensor *qx, float* x, int n) {
     for (int i = 0; i < n; i++) {
-        x[i] = qx->q[i] * qx->s[i / GS];
+        x[i] = qx->q[i] * qx->s;
     }
 }
 
 void quantize(QuantizedTensor *qx, float* x, int n) {
-    int num_groups = n / GS;
     float Q_MAX = 127.0f;
 
-    for (int group = 0; group < num_groups; group++) {
-
-        // find the max absolute value in the current group
-        float wmax = 0.0;
-        for (int i = 0; i < GS; i++) {
-            float val = fabs(x[group * GS + i]);
-            if (val > wmax) {
-                wmax = val;
-            }
+    // find the max absolute value
+    float wmax = 0.0;
+    for (int i = 0; i < n; i++) {
+        float val = fabs(x[i]);
+        if (val > wmax) {
+            wmax = val;
         }
+    }
 
-        // calculate and write the scaling factor
-        float scale = wmax / Q_MAX;
-        qx->s[group] = scale;
+    // calculate and write the scaling factor
+    float scale = wmax / Q_MAX;
+    qx->s = scale;
 
-        // calculate and write the quantized values
-        for (int i = 0; i < GS; i++) {
-            float quant_value = x[group * GS + i] / scale; // scale
-            int8_t quantized = (int8_t) round(quant_value); // round and clamp
-            qx->q[group * GS + i] = quantized;
-        }
+    // calculate and write the quantized values
+    for (int i = 0; i < n; i++) {
+        float quant_value = x[i] / scale; // scale
+        int8_t quantized = (int8_t) round(quant_value); // round and clamp
+        qx->q[i] = quantized;
     }
 }
 
@@ -179,8 +173,8 @@ QuantizedTensor *init_quantized_tensors(void **ptr, int n, int size_each) {
         res[i].q = (int8_t*)p;
         p = (int8_t*)p + size_each;
         /* map scale factors */
-        res[i].s = (float*)p;
-        p = (float*)p + size_each / GS;
+        res[i].s = *(float*)p;
+        p = (float*)p + 1;
     }
     *ptr = p; // advance ptr to current position
     return res;
@@ -227,16 +221,13 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     // read in the version number (uint32), has to be 1
     int version;
     if (fread(&version, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    if (version != 3) { fprintf(stderr, "Bad version %d, need version 3\n", version); exit(EXIT_FAILURE); }
-    int header_size = 256; // the header size for version 3 in bytes
+    if (version != 2) { fprintf(stderr, "Bad version %d, need version 2\n", version); exit(EXIT_FAILURE); }
+    int header_size = 256; // the header size for version 2 in bytes
     // read in the Config
     if (fread(config, sizeof(Config), 1, file) != 1) { exit(EXIT_FAILURE); }
     // read in flags
     uint8_t shared_classifier; // a byte to indicate if the classifier is shared
     if (fread(&shared_classifier, sizeof(uint8_t), 1, file) != 1) { exit(EXIT_FAILURE); }
-    int group_size; // the group size used in quantization
-    if (fread(&group_size, sizeof(int), 1, file) != 1) { exit(EXIT_FAILURE); }
-    GS = group_size; // set as global, as it will be used in many places
     // figure out the file size
     fseek(file, 0, SEEK_END); // move file pointer to end of file
     *file_size = ftell(file); // get the file size, in bytes
@@ -322,22 +313,17 @@ void matmul(float* xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
     int i;
     #pragma omp parallel for private(i)
     for (i = 0; i < d; i++) {
-
         float val = 0.0f;
         int32_t ival = 0;
         int in = i * n;
 
-        // do the matmul in groups of GS
+        // do the matmul
         int j;
-        for (j = 0; j <= n - GS; j += GS) {
-            for (int k = 0; k < GS; k++) {
-                ival += ((int32_t) x->q[j + k]) * ((int32_t) w->q[in + j + k]);
-            }
-            val += ((float) ival) * w->s[(in + j) / GS] * x->s[j / GS];
-            ival = 0;
+        for (j = 0; j <= n; j++) {
+            ival += ((int32_t) x->q[j]) * ((int32_t) w->q[in + j]);
         }
 
-        xout[i] = val;
+        xout[i] = ((float) ival) * w->s * x->s;
     }
 }
 

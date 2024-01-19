@@ -843,6 +843,63 @@ long time_in_ms() {
 }
 
 // ----------------------------------------------------------------------------
+// perplexity eval loop
+
+void eval(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, int steps) {
+    // assume prompt here is the full dataset over which to measure PPL
+    char prompt[4096];
+    FILE *prompt_file = fopen("eval_prompt.txt", "r");
+    fgets(prompt, 4096, prompt_file);
+    printf("String read: %s\n", prompt);
+
+    // encode the (string) prompt into tokens sequence
+    int num_prompt_tokens = 0;
+    int* prompt_tokens = (int*)malloc((strlen(prompt)+3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
+    encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
+    if (num_prompt_tokens < 1) {
+        fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
+        exit(EXIT_FAILURE);
+    }
+
+    int num_chunks = (num_prompt_tokens) / steps; // assume full length chunks
+
+    float nll = 0;
+    int count = 0;
+
+    printf("num_chunks: %d\n", num_chunks);
+
+    // start the main loop
+    int chunk = 0;
+    while (chunk < num_chunks) { // change back to num_chunks once kv cache freeing
+        printf("processing chunk %d\n", chunk);
+        int token = prompt_tokens[chunk*steps];
+
+        // free KV cache here!!!
+        for (int pos=0; pos < steps-1; pos++) {
+            float* logits = forward(transformer, token, pos);
+            token = prompt_tokens[chunk*steps + (pos+1)];
+            softmax(logits, sampler->vocab_size); // should store smax in place
+            float next_token_prob = logits[token]; // may need to specify vocab size here
+            nll += -log(next_token_prob);
+            count++;
+        }
+
+        // free / realloc KV cache
+        free_run_state(&transformer->state); // TODO test this
+        malloc_run_state(&transformer->state, &transformer->config);
+        chunk++;
+    }
+    printf("\n");
+
+    float nll_full = exp(nll / count);
+
+    printf("PPL: %f \n\n", nll_full);
+
+    fclose(prompt_file);
+    free(prompt_tokens);
+}
+
+// ----------------------------------------------------------------------------
 // generation loop
 
 void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
@@ -1032,7 +1089,7 @@ int main(int argc, char *argv[]) {
     int steps = 256;            // number of steps to run for
     char *prompt = NULL;        // prompt string
     unsigned long long rng_seed = 0; // seed rng with time by default
-    char *mode = "generate";    // generate|chat
+    char *mode = "eval";    // generate|chat
     char *system_prompt = NULL; // the (optional) system prompt to use in chat mode
 
     // poor man's C argparse so we can override the defaults above from the command line
@@ -1078,6 +1135,8 @@ int main(int argc, char *argv[]) {
         generate(&transformer, &tokenizer, &sampler, prompt, steps);
     } else if (strcmp(mode, "chat") == 0) {
         chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
+    } else if (strcmp(mode, "eval") == 0) {
+        eval(&transformer, &tokenizer, &sampler, steps);
     } else {
         fprintf(stderr, "unknown mode: %s\n", mode);
         error_usage();
