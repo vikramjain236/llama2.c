@@ -7,6 +7,12 @@ CC = gcc
 run: run.c
 	$(CC) -O3 -o run run.c -lm
 	$(CC) -O3 -o runq runq.c -lm
+	$(CC) -O3 -o runqg runq_g.c -lm
+	$(CC) -O3 -o runqng runq_ng.c -lm
+	$(CC) -O3 -o weightstats weight-stats.c -lm
+	$(CC) -O3 -o perplexity perplexity.c -lm
+	$(CC) -O3 -o qgperplexity qgperplexity.c -lm
+	$(CC) -O3 -o qngperplexity qngperplexity.c -lm
 
 # useful for a debug build, can then e.g. analyze with valgrind, example:
 # $ valgrind --leak-check=full ./run out/model.bin -n 3
